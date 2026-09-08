@@ -161,20 +161,22 @@ public sealed class InitialDeliveryEngine
         {
             RequireHost();
             if (string.IsNullOrWhiteSpace(commandId) || string.IsNullOrWhiteSpace(playerId) || definitionIds == null || definitionIds.Count == 0 || definitionIds.Any(string.IsNullOrWhiteSpace)) throw new ArgumentException("A complete starter bundle grant is required.");
-            var known = state.InitialDeliveries.SingleOrDefault(x => x.SourceCommandId == commandId);
-            if (known != null)
+            var known = state.InitialDeliveries.Where(x => x.SourceCommandId == commandId).OrderBy(x => x.GrantId, StringComparer.Ordinal).ToArray();
+            if (known.Length > 0)
             {
-                if (known.Owner.Key != AssetOwnerRef.Player(playerId).Key || !known.DefinitionIds.SequenceEqual(definitionIds)) throw new InvalidOperationException("Starter grant command ID payload conflict.");
-                return known;
+                if (known.Any(x => x.Owner.Key != AssetOwnerRef.Player(playerId).Key) || !known.SelectMany(x => x.DefinitionIds).SequenceEqual(definitionIds)) throw new InvalidOperationException("Starter grant command ID payload conflict.");
+                return known[0];
             }
             if (state.Economy.History.Any(x => x.Kind == "starter-bundle-granted" && x.ActorIds.Contains(playerId))) throw new InvalidOperationException("Starter bundle was already granted to this player identity.");
             var owner = AssetOwnerRef.Player(playerId);
             var assets = definitionIds.Select(definitionId => CreateVirtualAsset(definitionId, owner, "starter-bundle")).ToArray();
             if (assets.Length > 1) state.Assets.Bundles.Add(new AssetBundle { BundleId = Guid.NewGuid().ToString("N"), ComponentAssetIds = assets.Select(x => x.AssetId).ToList() });
-            var grant = CreateGrant(commandId + ":initial-delivery", commandId, owner, assets);
-            state.InitialDeliveries.Add(grant);
+            // Each starter vehicle is delivered independently. This keeps radio placement usable on
+            // short service tracks and avoids requiring an empty track long enough for the whole consist.
+            var grants = assets.Select((asset, index) => CreateGrant(commandId + ":initial-delivery:" + index, commandId, owner, new[] { asset })).ToArray();
+            state.InitialDeliveries.AddRange(grants);
             state.Economy.History.Add(new EconomicHistoryRecord { EventId = commandId, Kind = "starter-bundle-granted", ActorIds = new List<string> { playerId }, Fingerprint = string.Join("|", playerId, string.Join(",", definitionIds)) });
-            return grant;
+            return grants[0];
         }
     }
 
