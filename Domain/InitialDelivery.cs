@@ -165,6 +165,23 @@ public sealed class InitialDeliveryEngine
             if (known.Length > 0)
             {
                 if (known.Any(x => x.Owner.Key != AssetOwnerRef.Player(playerId).Key) || !known.SelectMany(x => x.DefinitionIds).SequenceEqual(definitionIds)) throw new InvalidOperationException("Starter grant command ID payload conflict.");
+                if (known.Length == 1 && known[0].AssetIds.Count > 1 && known[0].State == InitialDeliveryState.Available && string.IsNullOrWhiteSpace(known[0].PlacementCommandId))
+                {
+                    var legacy = known[0];
+                    state.InitialDeliveries.Remove(legacy);
+                    known = legacy.AssetIds.Select((assetId, index) => new InitialDeliveryGrant
+                    {
+                        GrantId = commandId + ":initial-delivery:" + index,
+                        SourceCommandId = commandId,
+                        Owner = Clone(legacy.Owner),
+                        AssetIds = new List<string> { assetId },
+                        DefinitionIds = new List<string> { legacy.DefinitionIds[index] },
+                        FreePlacement = legacy.FreePlacement,
+                        State = InitialDeliveryState.Available,
+                        ResultCode = "placement-available:migrated-from-bundle"
+                    }).ToArray();
+                    state.InitialDeliveries.AddRange(known);
+                }
                 return known[0];
             }
             if (state.Economy.History.Any(x => x.Kind == "starter-bundle-granted" && x.ActorIds.Contains(playerId))) throw new InvalidOperationException("Starter bundle was already granted to this player identity.");
