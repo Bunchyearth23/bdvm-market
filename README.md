@@ -30,6 +30,8 @@
 
 Market does not spawn Unity vehicles itself, own wallets, assign jobs or manufacture unlimited free stock. Delivery belongs to a runtime adapter; ownership belongs to Fleet; debits, credits and ledger history belong to Companies. If a required external integration cannot confirm an effect, the operation is compensated or marked for reconciliation.
 
+The source declares optional ports for Multiplayer, DVCustomLicenses and Passenger Jobs license migration. These ports are not runtime dependencies and no implementation is activated in this module. A future adapter must document and validate each external dependency before enabling projection, purchase suppression or refund handling.
+
 ## Dependencies and composition
 
 The project references Common, Companies and Fleet. Its `Domain/` sources are currently linked into `BDVM.Full` rather than compiled into the small module DLL. This temporary composition detail will change only with the planned standalone packaging work.
