@@ -164,7 +164,7 @@ public sealed class InitialDeliveryEngine
             var known = state.InitialDeliveries.Where(x => x.SourceCommandId == commandId).OrderBy(x => x.GrantId, StringComparer.Ordinal).ToArray();
             if (known.Length > 0)
             {
-                if (known.Any(x => x.Owner.Key != AssetOwnerRef.Player(playerId).Key) || !known.SelectMany(x => x.DefinitionIds).SequenceEqual(definitionIds)) throw new InvalidOperationException("Starter grant command ID payload conflict.");
+                if (known.Any(x => x.Owner.Key != AssetOwnerRef.Player(playerId).Key) || !known.SelectMany(x => x.DefinitionIds).Select(CanonicalDefinitionId).SequenceEqual(definitionIds.Select(CanonicalDefinitionId))) throw new InvalidOperationException("Starter grant command ID payload conflict.");
                 if (known.Length == 1 && known[0].AssetIds.Count > 1 && known[0].State == InitialDeliveryState.Available && string.IsNullOrWhiteSpace(known[0].PlacementCommandId))
                 {
                     var legacy = known[0];
@@ -202,6 +202,8 @@ public sealed class InitialDeliveryEngine
         var grant = new InitialDeliveryGrant { GrantId = grantId, SourceCommandId = sourceCommandId, Owner = Clone(owner), AssetIds = assets.Select(x => x.AssetId).ToList(), DefinitionIds = assets.Select(x => x.DefinitionId).ToList() };
         return grant;
     }
+
+    private static string CanonicalDefinitionId(string definitionId) => string.Equals(definitionId, "CarFlatcar", StringComparison.Ordinal) ? "FlatbedEmpty" : definitionId;
 
     private FleetAsset CreateVirtualAsset(string definitionId, AssetOwnerRef owner, string origin)
     {
