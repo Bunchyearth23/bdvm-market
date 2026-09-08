@@ -253,11 +253,7 @@ public sealed class FiniteMarketEngine
                 if (outcome == WorldOwnershipOutcome.Unknown) { listing.State = MarketListingState.DeliveryPending; return Pending(record, "world-owner-unknown"); }
                 return Commit(record, listing, listing.AssetId!);
             }
-            record.DeliveryOperationId = command.CommandId + ":delivery";
-            var delivered = delivery.Deliver(record.DeliveryOperationId, listing.DefinitionId, listing.LocationId);
-            if (delivered.Outcome == WorldOwnershipOutcome.NotApplied) return Compensate(record, listing, wallet, delivered.Detail);
-            if (delivered.Outcome == WorldOwnershipOutcome.Unknown || !ValidGuid(delivered.PersistentCarGuid)) { listing.State = MarketListingState.DeliveryPending; return Pending(record, delivered.Detail.Length == 0 ? "delivery-unknown" : delivered.Detail); }
-            return CommitNew(record, listing, delivered.PersistentCarGuid!);
+            return CommitVirtualNew(record, listing);
         }
     }
 
@@ -292,6 +288,32 @@ public sealed class FiniteMarketEngine
         listing.AssetId = asset.AssetId; record.AssetId = asset.AssetId;
         FleetManagementEngine.EnsureAsset(state, asset.AssetId, listing.CategoryId, listing.DefinitionId, listing.DefinitionId);
         return Commit(record, listing, asset.AssetId);
+    }
+
+    private MarketPurchaseRecord CommitVirtualNew(MarketPurchaseRecord record, MarketListing listing)
+    {
+        if (!state.Assets.Definitions.Any(x => x.DefinitionId == listing.DefinitionId))
+            state.Assets.Definitions.Add(new AssetDefinition { DefinitionId = listing.DefinitionId, Origin = "finite-market-catalog" });
+        var asset = FleetAsset.Create(listing.DefinitionId, Guid.NewGuid().ToString("D"));
+        asset.GameLink.State = PersistentLinkState.TemporarilyAbsent;
+        asset.GameLink.Detail = "Purchased virtual stock awaiting authorized initial delivery.";
+        state.Assets.Assets.Add(asset);
+        state.Ownership.Add(new AssetOwnership { AssetId = asset.AssetId, Owner = Clone(record.Buyer), Version = 1 });
+        var fleet = FleetManagementEngine.EnsureAsset(state, asset.AssetId, listing.CategoryId, listing.DefinitionId, listing.DefinitionId);
+        fleet.OperationalState = FleetOperationalState.Stored;
+        fleet.LastKnownLocation = "virtual:" + listing.LocationId;
+        fleet.Version++;
+        listing.AssetId = asset.AssetId;
+        record.AssetId = asset.AssetId;
+        record.OwnershipCommitted = true;
+        record.DeliveryOperationId = record.CommandId + ":initial-delivery";
+        state.InitialDeliveries.Add(InitialDeliveryEngine.CreateGrant(record.DeliveryOperationId, record.CommandId, record.Buyer, new[] { asset }));
+        listing.State = MarketListingState.Sold;
+        listing.ReservedBy = record.CommandId;
+        listing.Version++;
+        record.State = MarketPurchaseState.Succeeded;
+        record.ResultCode = "market-purchase-complete-placement-available";
+        return record;
     }
 
     private MarketPurchaseRecord Commit(MarketPurchaseRecord record, MarketListing listing, string assetId)
