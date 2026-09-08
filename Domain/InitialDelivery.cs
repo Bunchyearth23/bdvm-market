@@ -51,6 +51,16 @@ public interface IInitialDeliveryPort
     InitialDeliveryPortResult Inspect(string operationId, string trackId, InitialDeliveryTargetKind targetKind, IReadOnlyList<string> definitionIds);
 }
 
+public interface IInitialDeliveryCheckpointPort
+{
+    bool TryCheckpoint(InitialDeliveryGrant grant, string phase);
+}
+
+public sealed class NoOpInitialDeliveryCheckpointPort : IInitialDeliveryCheckpointPort
+{
+    public bool TryCheckpoint(InitialDeliveryGrant grant, string phase) => true;
+}
+
 public sealed class DisabledInitialDeliveryPort : IInitialDeliveryPort
 {
     private static InitialDeliveryPortResult Disabled() => new InitialDeliveryPortResult { Outcome = WorldOwnershipOutcome.NotApplied, Detail = "initial-delivery-adapter-disabled" };
@@ -65,12 +75,15 @@ public sealed class InitialDeliveryEngine
     private readonly VehicleAcquisitionSnapshot state;
     private readonly INetworkRoleDetector authority;
     private readonly IInitialDeliveryPort port;
+    private readonly IInitialDeliveryCheckpointPort checkpoint;
 
-    public InitialDeliveryEngine(VehicleAcquisitionSnapshot state, INetworkRoleDetector authority, IInitialDeliveryPort port)
+    public InitialDeliveryEngine(VehicleAcquisitionSnapshot state, INetworkRoleDetector authority, IInitialDeliveryPort port,
+        IInitialDeliveryCheckpointPort? checkpoint = null)
     {
         this.state = state ?? throw new ArgumentNullException(nameof(state));
         this.authority = authority ?? throw new ArgumentNullException(nameof(authority));
         this.port = port ?? throw new ArgumentNullException(nameof(port));
+        this.checkpoint = checkpoint ?? new NoOpInitialDeliveryCheckpointPort();
         VehicleAcquisitionPersistence.Validate(state);
     }
 
@@ -108,6 +121,13 @@ public sealed class InitialDeliveryEngine
             grant.State = InitialDeliveryState.PlacementPending;
             grant.ResultCode = "placement-pending";
             grant.Version++;
+            if (!TryCheckpoint(grant, "placement-pending"))
+            {
+                grant.State = InitialDeliveryState.ReconcileRequired;
+                grant.ResultCode = "placement-reconcile:checkpoint-pending-failed";
+                grant.Version++;
+                return grant;
+            }
             InitialDeliveryPortResult result;
             try { result = port.Place(command.CommandId + ":spawn", grant.TargetTrackId, command.TargetKind, grant.DefinitionIds); }
             catch (Exception exception)
@@ -115,9 +135,10 @@ public sealed class InitialDeliveryEngine
                 grant.State = InitialDeliveryState.ReconcileRequired;
                 grant.ResultCode = "placement-exception:" + exception.GetType().Name;
                 grant.Version++;
-                return grant;
+                return CheckpointResult(grant, "placement-exception");
             }
-            return Resolve(grant, result);
+            var resolved = Resolve(grant, result);
+            return CheckpointResult(resolved, "placement-result");
         }
     }
 
@@ -130,7 +151,7 @@ public sealed class InitialDeliveryEngine
             if (grant.State == InitialDeliveryState.Delivered || grant.State == InitialDeliveryState.Available) return grant;
             if (string.IsNullOrWhiteSpace(grant.PlacementCommandId) || string.IsNullOrWhiteSpace(grant.TargetTrackId) || !grant.TargetKind.HasValue) throw new InvalidOperationException("Pending delivery has no complete placement identity.");
             var result = port.Inspect(grant.PlacementCommandId + ":spawn", grant.TargetTrackId!, grant.TargetKind.Value, grant.DefinitionIds);
-            return Resolve(grant, result);
+            return CheckpointResult(Resolve(grant, result), "placement-reconciled");
         }
     }
 
@@ -215,6 +236,24 @@ public sealed class InitialDeliveryEngine
         grant.ResultCode = "initial-delivery-complete";
         grant.Version++;
         return grant;
+    }
+
+    private InitialDeliveryGrant CheckpointResult(InitialDeliveryGrant grant, string phase)
+    {
+        if (TryCheckpoint(grant, phase)) return grant;
+        if (grant.State != InitialDeliveryState.Available)
+        {
+            grant.State = InitialDeliveryState.ReconcileRequired;
+            grant.ResultCode = "placement-reconcile:checkpoint-result-failed";
+            grant.Version++;
+        }
+        return grant;
+    }
+
+    private bool TryCheckpoint(InitialDeliveryGrant grant, string phase)
+    {
+        try { return checkpoint.TryCheckpoint(grant, phase); }
+        catch { return false; }
     }
 
     private void Authorize(InitialDeliveryGrant grant, string requester)
