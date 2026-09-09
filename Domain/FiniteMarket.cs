@@ -116,6 +116,16 @@ public interface IMarketDeliveryPort
     MarketDeliveryResult Inspect(string operationId, string definitionId, string locationId);
 }
 
+public interface IMarketPurchaseCheckpointPort
+{
+    bool TryCheckpoint(MarketPurchaseRecord purchase, string phase);
+}
+
+public sealed class NoOpMarketPurchaseCheckpointPort : IMarketPurchaseCheckpointPort
+{
+    public bool TryCheckpoint(MarketPurchaseRecord purchase, string phase) => true;
+}
+
 public sealed class DisabledMarketDeliveryPort : IMarketDeliveryPort
 {
     public MarketDeliveryResult Deliver(string operationId, string definitionId, string locationId) => new MarketDeliveryResult { Outcome = WorldOwnershipOutcome.NotApplied, Detail = "new-vehicle-delivery-adapter-disabled" };
@@ -129,11 +139,14 @@ public sealed class FiniteMarketEngine
     private readonly INetworkRoleDetector authority;
     private readonly IExistingVehicleOwnershipAdapter ownershipWorld;
     private readonly IMarketDeliveryPort delivery;
+    private readonly IMarketPurchaseCheckpointPort checkpoint;
 
-    public FiniteMarketEngine(VehicleAcquisitionSnapshot state, INetworkRoleDetector authority, IExistingVehicleOwnershipAdapter ownershipWorld, IMarketDeliveryPort delivery)
+    public FiniteMarketEngine(VehicleAcquisitionSnapshot state, INetworkRoleDetector authority, IExistingVehicleOwnershipAdapter ownershipWorld, IMarketDeliveryPort delivery,
+        IMarketPurchaseCheckpointPort? checkpoint = null)
     {
         this.state = state ?? throw new ArgumentNullException(nameof(state)); this.authority = authority ?? throw new ArgumentNullException(nameof(authority));
         this.ownershipWorld = ownershipWorld ?? throw new ArgumentNullException(nameof(ownershipWorld)); this.delivery = delivery ?? throw new ArgumentNullException(nameof(delivery));
+        this.checkpoint = checkpoint ?? new NoOpMarketPurchaseCheckpointPort();
         VehicleAcquisitionPersistence.Validate(state);
     }
 
@@ -245,15 +258,19 @@ public sealed class FiniteMarketEngine
             listing!.State = MarketListingState.Reserved; listing.ReservedBy = command.CommandId; listing.Version++;
             var wallet = state.Economy.Wallets.Single(x => x.Account.Key == command.Payer.Key); wallet.Balance -= listing.Price; wallet.Version++; record.Debited = true;
             if (!state.Economy.Ledger.Any(x => x.EntryId == command.CommandId + ":market-debit")) state.Economy.Ledger.Add(new LedgerEntry { EntryId = command.CommandId + ":market-debit", CommandId = command.CommandId, Kind = LedgerEntryKind.VehiclePurchase, Debit = wallet.Account, Amount = listing.Price, Detail = "finite-market;listing=" + listing.ListingId + ";location=" + listing.LocationId + ";factor=" + listing.MarketFactor + ";fee=" + listing.TransferFee });
+            record.DeliveryOperationId = command.CommandId + (listing.Kind == MarketListingKind.ExistingAsset ? ":ownership" : ":initial-delivery");
+            record.State = MarketPurchaseState.ReconcileRequired;
+            record.ResultCode = "market-purchase-pending";
+            if (!TryCheckpoint(record, "purchase-pending")) return Compensate(record, listing, wallet, "checkpoint-pending-failed");
             if (listing.Kind == MarketListingKind.ExistingAsset)
             {
                 var asset = state.Assets.Assets.Single(x => x.AssetId == listing.AssetId);
-                var outcome = ownershipWorld.ApplyOwner(command.CommandId + ":ownership", asset.GameLink.Value!, command.Buyer);
-                if (outcome == WorldOwnershipOutcome.NotApplied) return Compensate(record, listing, wallet, "world-owner-not-applied");
-                if (outcome == WorldOwnershipOutcome.Unknown) { listing.State = MarketListingState.DeliveryPending; return Pending(record, "world-owner-unknown"); }
-                return Commit(record, listing, listing.AssetId!);
+                var outcome = ownershipWorld.ApplyOwner(record.DeliveryOperationId, asset.GameLink.Value!, command.Buyer);
+                if (outcome == WorldOwnershipOutcome.NotApplied) return CheckpointResult(Compensate(record, listing, wallet, "world-owner-not-applied"), "purchase-compensated");
+                if (outcome == WorldOwnershipOutcome.Unknown) { listing.State = MarketListingState.DeliveryPending; return CheckpointResult(Pending(record, "world-owner-unknown"), "purchase-world-unknown"); }
+                return CheckpointResult(Commit(record, listing, listing.AssetId!), "purchase-complete");
             }
-            return CommitVirtualNew(record, listing);
+            return CheckpointResult(CommitVirtualNew(record, listing), "purchase-complete");
         }
     }
 
@@ -261,20 +278,31 @@ public sealed class FiniteMarketEngine
     {
         lock (gate)
         {
+            RequireHost();
             var record = state.Market.Purchases.Single(x => x.CommandId == commandId); if (record.State != MarketPurchaseState.ReconcileRequired) return record;
             var listing = state.Market.Listings.Single(x => x.ListingId == record.ListingId);
             if (listing.Kind == MarketListingKind.ExistingAsset)
             {
                 var asset = state.Assets.Assets.Single(x => x.AssetId == listing.AssetId);
                 var outcome = ownershipWorld.InspectOwner(asset.GameLink.Value!, record.Buyer);
-                if (outcome == WorldOwnershipOutcome.NotApplied) outcome = ownershipWorld.ApplyOwner(record.CommandId + ":ownership", asset.GameLink.Value!, record.Buyer);
-                if (outcome != WorldOwnershipOutcome.Applied) return Pending(record, "world-owner-still-unknown");
-                return Commit(record, listing, listing.AssetId!);
+                if (outcome == WorldOwnershipOutcome.NotApplied)
+                {
+                    var wallet = state.Economy.Wallets.Single(x => x.Account.Key == record.Payer.Key);
+                    return CheckpointResult(Compensate(record, listing, wallet, "world-owner-not-applied"), "purchase-compensated");
+                }
+                if (outcome != WorldOwnershipOutcome.Applied) return CheckpointResult(Pending(record, "world-owner-still-unknown"), "purchase-world-unknown");
+                return CheckpointResult(Commit(record, listing, listing.AssetId!), "purchase-reconciled");
             }
+            if (record.OwnershipCommitted && !string.IsNullOrWhiteSpace(record.AssetId))
+                return CheckpointResult(Commit(record, listing, record.AssetId!), "purchase-reconciled");
             var delivered = delivery.Inspect(record.DeliveryOperationId, listing.DefinitionId, listing.LocationId);
-            if (delivered.Outcome == WorldOwnershipOutcome.NotApplied) delivered = delivery.Deliver(record.DeliveryOperationId, listing.DefinitionId, listing.LocationId);
-            if (delivered.Outcome != WorldOwnershipOutcome.Applied || !ValidGuid(delivered.PersistentCarGuid)) return Pending(record, "delivery-still-unknown");
-            return CommitNew(record, listing, delivered.PersistentCarGuid!);
+            if (delivered.Outcome == WorldOwnershipOutcome.NotApplied)
+            {
+                var wallet = state.Economy.Wallets.Single(x => x.Account.Key == record.Payer.Key);
+                return CheckpointResult(Compensate(record, listing, wallet, "delivery-not-applied"), "purchase-compensated");
+            }
+            if (delivered.Outcome != WorldOwnershipOutcome.Applied || !ValidGuid(delivered.PersistentCarGuid)) return CheckpointResult(Pending(record, "delivery-still-unknown"), "purchase-world-unknown");
+            return CheckpointResult(CommitNew(record, listing, delivered.PersistentCarGuid!), "purchase-reconciled");
         }
     }
 
@@ -330,9 +358,29 @@ public sealed class FiniteMarketEngine
 
     private MarketPurchaseRecord Compensate(MarketPurchaseRecord record, MarketListing listing, Wallet wallet, string detail)
     {
-        if (record.Debited) { wallet.Balance += record.Price; wallet.Version++; record.Debited = false; }
+        if (record.Debited)
+        {
+            wallet.Balance += record.Price; wallet.Version++; record.Debited = false;
+            if (!state.Economy.Ledger.Any(x => x.EntryId == record.CommandId + ":market-compensation"))
+                state.Economy.Ledger.Add(new LedgerEntry { EntryId = record.CommandId + ":market-compensation", CommandId = record.CommandId, Kind = LedgerEntryKind.VehiclePurchase, Credit = wallet.Account, Amount = record.Price, Detail = "finite-market-compensation;listing=" + listing.ListingId + ";reason=" + detail });
+        }
         listing.State = MarketListingState.Available; listing.ReservedBy = null; listing.Version++;
         record.State = MarketPurchaseState.Compensated; record.ResultCode = "delivery-compensated:" + detail; return record;
+    }
+
+    private MarketPurchaseRecord CheckpointResult(MarketPurchaseRecord record, string phase)
+    {
+        if (TryCheckpoint(record, phase)) return record;
+        if (record.State == MarketPurchaseState.Compensated) return record;
+        record.State = MarketPurchaseState.ReconcileRequired;
+        record.ResultCode = "market-purchase-reconcile:checkpoint-result-failed";
+        return record;
+    }
+
+    private bool TryCheckpoint(MarketPurchaseRecord record, string phase)
+    {
+        try { return checkpoint.TryCheckpoint(record, phase); }
+        catch { return false; }
     }
 
     private string? Validate(MarketPurchaseCommand command, MarketListing? listing)
