@@ -24,6 +24,7 @@ public sealed class InitialDeliveryGrant
     [DataMember(Name = "placementFingerprint", Order = 11)] public string? PlacementFingerprint { get; set; }
     [DataMember(Name = "resultCode", Order = 12)] public string ResultCode { get; set; } = "placement-available";
     [DataMember(Name = "version", Order = 13)] public long Version { get; set; } = 1;
+    [DataMember(Name = "authorizedOperator", Order = 14)] public AssetOwnerRef? AuthorizedOperator { get; set; }
 }
 
 [DataContract]
@@ -197,6 +198,36 @@ public sealed class InitialDeliveryEngine
         }
     }
 
+    public IReadOnlyList<InitialDeliveryGrant> GrantLeaseDelivery(string commandId, string leaseId)
+    {
+        lock (gate)
+        {
+            RequireHost();
+            if (string.IsNullOrWhiteSpace(commandId) || string.IsNullOrWhiteSpace(leaseId)) throw new ArgumentException("A lease delivery identity is required.");
+            var lease = state.Leases.SingleOrDefault(value => value.LeaseId == leaseId) ?? throw new InvalidOperationException("Unknown inbound lease.");
+            if ((lease.State != LeaseState.Active && lease.State != LeaseState.Delinquent) || lease.Lessee == null) throw new InvalidOperationException("Only an accepted lease can receive delivery rights.");
+            var known = state.InitialDeliveries.Where(value => value.SourceCommandId == commandId).OrderBy(value => value.GrantId, StringComparer.Ordinal).ToArray();
+            if (known.Length > 0)
+            {
+                if (!known.SelectMany(value => value.AssetIds).OrderBy(value => value, StringComparer.Ordinal).SequenceEqual(lease.AssetIds.OrderBy(value => value, StringComparer.Ordinal)))
+                    throw new InvalidOperationException("Lease delivery command ID payload conflict.");
+                return known;
+            }
+            var grants = lease.AssetIds.Select((assetId, index) =>
+            {
+                var asset = state.Assets.Assets.Single(value => value.AssetId == assetId);
+                var owner = state.Ownership.Single(value => value.AssetId == assetId).Owner;
+                if (owner.Key != lease.Lessor.Key || asset.GameLink.State == PersistentLinkState.Resolved) throw new InvalidOperationException("Lease delivery requires lessor-owned virtual stock.");
+                var grant = CreateGrant(commandId + ":initial-delivery:" + index, commandId, owner, new[] { asset });
+                grant.AuthorizedOperator = Clone(lease.Lessee);
+                grant.ResultCode = "lease-placement-available";
+                return grant;
+            }).ToArray();
+            state.InitialDeliveries.AddRange(grants);
+            return grants;
+        }
+    }
+
     internal static InitialDeliveryGrant CreateGrant(string grantId, string sourceCommandId, AssetOwnerRef owner, IReadOnlyList<FleetAsset> assets)
     {
         var grant = new InitialDeliveryGrant { GrantId = grantId, SourceCommandId = sourceCommandId, Owner = Clone(owner), AssetIds = assets.Select(x => x.AssetId).ToList(), DefinitionIds = assets.Select(x => x.DefinitionId).ToList() };
@@ -280,13 +311,14 @@ public sealed class InitialDeliveryEngine
     private void Authorize(InitialDeliveryGrant grant, string requester)
     {
         var player = state.Economy.Players.SingleOrDefault(x => x.PlayerId == requester) ?? throw new InvalidOperationException("Unknown requester.");
-        if (grant.Owner.Kind == AssetOwnerKind.Player)
+        var authorized = grant.AuthorizedOperator ?? grant.Owner;
+        if (authorized.Kind == AssetOwnerKind.Player)
         {
-            if (grant.Owner.OwnerId != player.PlayerId) throw new UnauthorizedAccessException("Only the owner can place personal rolling stock.");
+            if (authorized.OwnerId != player.PlayerId) throw new UnauthorizedAccessException("Only the authorized player can place this rolling stock.");
             return;
         }
-        if (grant.Owner.Kind != AssetOwnerKind.Company || player.CompanyId != grant.Owner.OwnerId) throw new UnauthorizedAccessException("Requester does not belong to the owning company.");
-        var company = state.Economy.Companies.Single(x => x.CompanyId == grant.Owner.OwnerId);
+        if (authorized.Kind != AssetOwnerKind.Company || player.CompanyId != authorized.OwnerId) throw new UnauthorizedAccessException("Requester does not belong to the authorized company.");
+        var company = state.Economy.Companies.Single(x => x.CompanyId == authorized.OwnerId);
         if (company.Liquidating || (company.LeaderId != requester && (!company.DelegatedPermissions.TryGetValue(requester, out var rights) || !rights.Contains(CompanyPermission.ManageFleet)))) throw new UnauthorizedAccessException("ManageFleet permission is required.");
     }
 
@@ -311,6 +343,7 @@ public static class InitialDeliveryValidation
         foreach (var grant in grants)
         {
             if (grant == null || string.IsNullOrWhiteSpace(grant.GrantId) || string.IsNullOrWhiteSpace(grant.SourceCommandId) || grant.Owner == null || grant.AssetIds == null || grant.DefinitionIds == null || grant.AssetIds.Count == 0 || grant.AssetIds.Count != grant.DefinitionIds.Count || grant.AssetIds.Distinct(StringComparer.Ordinal).Count() != grant.AssetIds.Count || grant.AssetIds.Any(id => !state.Assets.Assets.Any(a => a.AssetId == id)) || grant.DefinitionIds.Any(string.IsNullOrWhiteSpace) || grant.Version < 1) throw new InvalidOperationException("Invalid initial delivery grant.");
+            if (grant.AuthorizedOperator != null && (string.IsNullOrWhiteSpace(grant.AuthorizedOperator.OwnerId) || (grant.AuthorizedOperator.Kind != AssetOwnerKind.Player && grant.AuthorizedOperator.Kind != AssetOwnerKind.Company))) throw new InvalidOperationException("Invalid initial delivery authorized operator.");
             if (grant.State == InitialDeliveryState.Delivered && grant.AssetIds.Any(id => state.Assets.Assets.Single(a => a.AssetId == id).GameLink.State != PersistentLinkState.Resolved)) throw new InvalidOperationException("Delivered grant contains an unresolved asset.");
         }
     }
