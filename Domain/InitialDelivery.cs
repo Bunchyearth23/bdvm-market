@@ -152,6 +152,17 @@ public sealed class InitialDeliveryEngine
             if (grant.State == InitialDeliveryState.Delivered || grant.State == InitialDeliveryState.Available) return grant;
             if (string.IsNullOrWhiteSpace(grant.PlacementCommandId) || string.IsNullOrWhiteSpace(grant.TargetTrackId) || !grant.TargetKind.HasValue) throw new InvalidOperationException("Pending delivery has no complete placement identity.");
             var result = port.Inspect(grant.PlacementCommandId + ":spawn", grant.TargetTrackId!, grant.TargetKind.Value, grant.DefinitionIds);
+            if (result.Outcome != WorldOwnershipOutcome.Applied && grant.AssetIds.All(assetId => state.Assets.Assets.Single(x => x.AssetId == assetId).GameLink.State != PersistentLinkState.Resolved))
+            {
+                grant.State = InitialDeliveryState.Available;
+                grant.ResultCode = "placement-released-for-radio-retry:" + SafeDetail(result.Detail);
+                grant.PlacementCommandId = null;
+                grant.PlacementFingerprint = null;
+                grant.TargetTrackId = null;
+                grant.TargetKind = null;
+                grant.Version++;
+                return CheckpointResult(grant, "placement-released-for-radio-retry");
+            }
             return CheckpointResult(Resolve(grant, result), "placement-reconciled");
         }
     }
