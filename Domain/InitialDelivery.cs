@@ -93,6 +93,38 @@ public sealed class InitialDeliveryEngine
         lock (gate)
         {
             RequireHost(); Require(command);
+            var existing = state.InitialDeliveries.SingleOrDefault(x => x.GrantId == command.GrantId);
+            if (existing != null && existing.PlacementCommandId == command.CommandId)
+            {
+                if (!string.Equals(existing.PlacementFingerprint, Fingerprint(command), StringComparison.Ordinal)) throw new InvalidOperationException("Initial delivery command ID payload conflict.");
+                return existing;
+            }
+        }
+        var prepared = Prepare(command);
+        if (prepared.State != InitialDeliveryState.PlacementPending)
+            return prepared;
+
+        InitialDeliveryPortResult result;
+        try { result = port.Place(command.CommandId + ":spawn", prepared.TargetTrackId!, command.TargetKind, prepared.DefinitionIds); }
+        catch (Exception exception)
+        {
+            lock (gate)
+            {
+                var grant = FindCommandGrant(command);
+                grant.State = InitialDeliveryState.ReconcileRequired;
+                grant.ResultCode = "placement-exception:" + exception.GetType().Name;
+                grant.Version++;
+                return CheckpointResult(grant, "placement-exception");
+            }
+        }
+        return Complete(command.CommandId, command.RequesterId, command.GrantId, result);
+    }
+
+    public InitialDeliveryGrant Prepare(InitialDeliveryCommand command)
+    {
+        lock (gate)
+        {
+            RequireHost(); Require(command);
             var grant = state.InitialDeliveries.SingleOrDefault(x => x.GrantId == command.GrantId) ?? throw new InvalidOperationException("Unknown initial delivery grant.");
             var fingerprint = Fingerprint(command);
             if (grant.PlacementCommandId == command.CommandId)
@@ -129,18 +161,31 @@ public sealed class InitialDeliveryEngine
                 grant.Version++;
                 return grant;
             }
-            InitialDeliveryPortResult result;
-            try { result = port.Place(command.CommandId + ":spawn", grant.TargetTrackId, command.TargetKind, grant.DefinitionIds); }
-            catch (Exception exception)
-            {
-                grant.State = InitialDeliveryState.ReconcileRequired;
-                grant.ResultCode = "placement-exception:" + exception.GetType().Name;
-                grant.Version++;
-                return CheckpointResult(grant, "placement-exception");
-            }
+            return grant;
+        }
+    }
+
+    public InitialDeliveryGrant Complete(string commandId, string requesterId, string grantId, InitialDeliveryPortResult result)
+    {
+        if (result == null) throw new ArgumentNullException(nameof(result));
+        lock (gate)
+        {
+            RequireHost();
+            var grant = FindCommandGrant(new InitialDeliveryCommand { CommandId = commandId, RequesterId = requesterId, GrantId = grantId });
+            Authorize(grant, requesterId);
+            if (grant.State != InitialDeliveryState.PlacementPending)
+                return grant;
             var resolved = Resolve(grant, result);
             return CheckpointResult(resolved, "placement-result");
         }
+    }
+
+    private InitialDeliveryGrant FindCommandGrant(InitialDeliveryCommand command)
+    {
+        var grant = state.InitialDeliveries.SingleOrDefault(x => x.GrantId == command.GrantId) ?? throw new InvalidOperationException("Unknown initial delivery grant.");
+        if (!string.Equals(grant.PlacementCommandId, command.CommandId, StringComparison.Ordinal)) throw new InvalidOperationException("Initial delivery command identity mismatch.");
+        Authorize(grant, command.RequesterId);
+        return grant;
     }
 
     public InitialDeliveryGrant Reconcile(string grantId)
